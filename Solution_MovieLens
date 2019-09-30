@@ -1,0 +1,215 @@
+
+from pyspark import SparkContext, SparkConf
+
+conf = SparkConf().setMaster('yarn-client').setAppName('Movie_lens')
+
+sc =SparkContext(conf=conf)
+
+from pyspark.sql.functions import col,count,avg,sum,udf
+
+from pyspark.sql.types import StringType
+
+
+
+### Stage1-a: Loading, parsing and handling bad records from movies raw data.
+
+# Loading and converting '::' delimited data into separate fields.
+
+
+moviedata= sc.textFile("/user/srikarthik/Movies-Data/movies.dat"). \
+           map(lambda x: x.strip().split('::'))
+
+
+'''converting pipe delimited genres data into comma separated data and 
+seggregating bad records and good records.'''
+
+
+movieParsed= moviedata.map(lambda x: (int(x[0]),x[1],x[2].replace('|',',')))
+
+bad_records= movieParsed.filter(lambda x: len(x)!=3)
+
+movies_clean= movieParsed.filter(lambda x: len(x)==3)
+
+badCount = bad_records.count()
+
+def badrecords(badcount,foldername):
+	if badCount==0:
+		print('No bad records in',foldername)
+	else:
+		print('Number of bad records in',foldername+': ', badCount)
+		bad_records.map(lambda x: ','.join(str(i) for i in x)).SaveAsTextFile("/user/srikarthik/movies_badRecords/"+ foldername)
+
+badrecords(badCount,'Movie data')
+
+
+'''Stage1-b: Loading and parsing the ratings raw data 
+(UserID::MovieID::Rating::Timestamp) and converting all fields 
+to integer as data is integer type'''
+
+ratingsdata= sc.textFile("/user/srikarthik/Movies-Data/ratings.dat").map(lambda x: x.strip().split('::')).map(lambda x: [int(i) for i in x])
+
+#Handling bad records and separating good records
+
+bad_records= ratingsdata.filter(lambda x: len(x)!=4)
+
+badCount = bad_records.count()
+
+badrecords(badCount,'Ratings Data')
+
+ratings_clean= ratingsdata.filter(lambda x: len(x)==4)
+
+
+'''
+Stage1-c: Loading and parsing the users raw data 
+(UserID::Gender::Age::Occupation::Zip-code )
+'''
+userdata = sc.textFile("/user/srikarthik/Movies-Data/users.dat"). \
+           map(lambda x: x.strip().split('::')). \
+           map(lambda x: (int(x[0]),x[1],int(x[2]),int(x[3]),x[4]))
+
+
+#Handling bad records and separating good records
+
+bad_records= userdata.filter(lambda x: len(x)!=5)
+
+badCount = bad_records.count()
+
+badrecords(badCount,'Users Data')
+
+users_clean= userdata.filter(lambda x: len(x)==5)
+
+
+###Stage2 : Converting RDD into dataframes
+
+movies= movies_clean.toDF(['MovieID', 'Title', 'Genres' ])
+
+ratings= ratings_clean.toDF(['UserID','MovieID','Rating','Timestamp'])
+
+users= users_clean.toDF(['UserID','Gender','Age','Occupation','ZipCode'])
+
+'''
+KPI 1. Top ten most viewed movies with their movies Name 
+(Ascending or Descending order) 
+
+As per document,Movies data is entered manually.
+So,we need to remove duplicates  '''
+
+
+movie_ratings = movies.join(ratings,'MovieID'). \
+                dropDuplicates(['MovieID','UserID'])
+
+
+top10MostViewed = movie_ratings.groupBy('MovieID','Title'). \
+                  agg(count('MovieID').alias('total_ratings')). \
+                  sort(['total_ratings','Title'],ascending=[0,1]).limit(10)
+
+# Saving result in parquet format
+
+top10MostViewed.write.parquet("/user/srikarthik/movielens/result1")
+
+'''
+KPI 2. Top twenty rated movies (Condition: The movie should be rated/viewed 
+by at least 40 users)  
+'''
+
+
+min40users = movie_ratings.groupBy('MovieID','Title'). \
+            agg(count('Rating').alias('total_count')). \
+            filter(col('total_count')>40)
+
+Top20_min40users = min40users.join(ratings,'MovieID'). \
+                   groupby('Title').agg(avg('Rating'). \
+                   alias('avg_rating')). \
+                   sort(['avg_rating','Title'],ascending=[0,1]).limit(20)
+
+# Saving result in json format
+
+Top20_min40users.write.json("/user/srikarthik/movielens/result2")
+
+'''
+KPI-3. We wish to know how have the genres ranked by Average Rating,
+for each profession and age group. The age groups to be considered 
+are: 18-34, 35-49 and 50+. 
+
+'''
+
+
+#Since list of genres in one column we need separate them
+
+def genre_len(x):
+	if len(x)==3:
+		x.extend([None,None])
+	elif len(x)==4:
+		x.append(None)
+	return x
+
+
+genres = movies.rdd.map(lambda x: (str(x[0])+'|'+x[1]+'|'+"|".join(x[2].split(',')))). \
+         map(lambda x : x.split('|')). \
+         map(genre_len).map(lambda x: (int(x[0]), x[1], x[2], x[3], x[4] )). \
+         toDF(['MovieID','Title','Genre1','Genre2','Genre3'])
+
+# We donot need columns Timestamp,Zip-code,Gender. Hence we will drop.
+
+user_movie_rating = genres.join(ratings,'MovieID').join(users,'UserID'). \
+                    drop('Timestamp','ZipCode','Gender')
+
+'''
+1)As per document occupation has been coded with numbers instead of text.
+
+2)As per document, age_group defined as = {'1':"under18",'18':'18-24',
+'25':'25-34','35':'35-44','45':'45-49','50':'50-55','56':'56+'}.
+And as per KPI3 age groups to be considered are: 18-34, 35-49 and 50+. 
+'''
+
+
+age_group = {'1':"under18",'18':'18-35','25':'18-35','35':'36-50', \
+             '45':'36-50','50':'50+','56':'50+'}
+
+profession = {0:"other or not specified ",1:  "academic/educator", \
+              2:  "artist" , 3:  "clerical/admin" ,4:  \
+              "college/grad student" , 5:  "customer service" , 6:  \
+              "doctor/health care" , 7:  "executive/managerial" , 8: \
+              "farmer" , 9:  "homemaker" , 10:  "K-12 student" , 11:  \
+              "lawyer" , 12:  "programmer" , 13:  "retired" , 14:  \
+              "sales/marketing" , 15:  "scientist" , 16:  \
+              "self-employed" , 17:  "technician/engineer" , \
+              18:  "tradesman/craftsman" , 19:  "unemployed" , 20:  "writer" }
+
+
+'''Defining UDF to replace occupation numbers with respective designatation 
+in text format inside data frame'''
+
+user_func =  udf (lambda x: profession.get(x), StringType())
+
+df1 =  user_movie_rating.withColumn('profession',user_func(user_movie_rating.Occupation)). \
+       drop('occupation')
+
+# Combining different ages into age groups
+
+df2 =df1.withColumn('agegroup',col('age').cast('string')).drop('age'). \
+         na.replace(age_group,col('agegroup'))
+
+# lets make profession,agegroup, genre as key and rating as value
+
+gen1= df2.filter(df2.Genre1.isNotNull()). \
+      select('profession','agegroup','genre1','Rating')
+
+gen2= df2.filter(df2.Genre2.isNotNull()). \
+      select('profession','agegroup','genre2','Rating')
+
+gen3 = df2.filter(df2.Genre3.isNotNull()). \
+       select('profession','agegroup','genre3','Rating')
+
+
+allgen= gen1.union(gen2).union(gen3).withColumnRenamed('genre1','genre')
+
+
+result = allgen.groupBy('profession','agegroup','genre'). \
+         agg(avg('Rating').alias('avg_rating')). \
+         sort('profession','agegroup','genre')
+
+
+# Saving result in CSV format
+
+result.write.csv("/user/srikarthik/movielens/result3",header=True)
